@@ -69,7 +69,20 @@ Intuition:
         the information stored in the latent representation to learn models for other tasks. 
         The task we will do, is use the input to hidden to create the embedding, then feed this
         to an architecture to perform multi-label classification based on gene pathways
+
+
+Tests to write:
+    > .preprocess_weights() :   second_order_probs are valid probabilities (sum==1, all are >=0)
+                                first_order_probs (weights in d_graph) are valid probabilities (sum==1, all are >=0)
+                                integrity of d_graph is maintained after applying the function
+    > .generate_walks()     :   ensure sample number == num_walks
+                                ensure length of one sample == walk_length
+                                ensure every item, with index i, in the sample, is in the 
+                                    neighborhood of i-1, for all indices >=1
+                                ensure neighbors are selected with the correct transition
+                                    probabilities
 '''
+import random
 
 import networkx as nx
 
@@ -201,6 +214,79 @@ class Node2Vec:
                 d_graph[source][neighbor][key] = normalised_transition_probabilities
 
                 print()
+
+    def generate_walks(self, num_walks: int = None, walk_length: int = None):
+        '''
+        Simulate random walks. Can be given specific instructions
+        for the number of walks and the walk length
+
+        Input:
+        > num_walks:    Int. The number of walks per node
+        > walk_length:  Int. The length of the walk per node
+
+        '''
+        # Set up
+        graph = self.d_graph
+        if not num_walks:
+            num_walks = self.num_walks
+        if not walk_length:
+            walk_length = self.walk_length
+
+        walks = []
+
+        nodes = list(graph.nodes)
+
+        # Generate walks
+        for walk in range(num_walks):
+
+            print(f"Walk iteration: {walk}")
+            random.shuffle(nodes)
+
+            for source in nodes:
+
+                sample = [source]
+
+                # Select a node from the neighborhood of source
+                neighbors = [n for n in graph.neighbors(source)]
+                probabilities = [graph[source][n]['weight'] for n in neighbors]
+                neighbor = random.choices(neighbors, weights=probabilities, k=1)[0]
+                sample.append(neighbor)
+
+                # Generate samples
+                start_node = source             # Node 0 in 2nd order markovian
+                current_node = neighbor         # Node 1 in 2nd order markovian
+                next_node = None                # Node 2 in 2nd order markovian. We are sampling for this one.
+
+                while len(sample) < walk_length:
+
+                    second_order_probs = graph[start_node][current_node]['second_order_probs']
+
+                    neighbors, probabilities = [], []
+
+                    for key, value in second_order_probs.items():
+
+                        neighbors.append(key)
+                        probabilities.append(value)
+
+                    if len(neighbors) == 0:
+                        continue
+
+                    next_node = random.choices(neighbors, weights=probabilities, k=1)[0]
+
+                    sample.append(next_node)
+
+                    start_node = current_node
+                    current_node = next_node
+                    next_node = None
+                
+                walks.append(sample)
+
+        return walks
+
+
+
+
+        
                     
                     
 

@@ -35,3 +35,10 @@ print('\n')
 
 print(G.dims)
 print(G.num_walks)
+
+print()
+
+# print(G.generate_walks(num_walks=10, walk_length=10))
+
+for w in G.generate_walks(num_walks=10, walk_length=10):
+    print(w)
