@@ -7,6 +7,12 @@ Model is implemented based on paper:
     eprint={1607.00653},
     archivePrefix={arXiv},
     primaryClass={cs.SI}
+Code inspiration:
+    https://github.com/eliorc/node2vec/blob/master/node2vec/node2vec.py#L122
+    https://github.com/aditya-grover/node2vec
+    https://www.tensorflow.org/tutorials/text/word2vec
+    https://towardsdatascience.com/node2vec-embeddings-for-graph-data-32a866340fef
+
 }
 
 Assumptions:
@@ -45,6 +51,10 @@ Intuition:
         in there. The length of the walk was 12 so it contains some repeats. The context, k, 
         is a constant shared between all training examples. If k=5, 5 of the 10 nodes will 
         be selected to make up Y. Now X=u, Y=randChoice(N(u), 5, repeat=False)
+        !! this is incorrect          v
+        infact X=u Y=randChoice(N(u), 1, repeat=False) for all nodes in N(u)
+        That is, an example is [target_node, context_node_i]. 
+        See definition of a skip-gram for further clarification
     > d is the dimension of the hidden layer. This is the number of features that you are
         learning
     > The input to the model is X=u. This is represented as a one-hot vector of size 
@@ -82,14 +92,26 @@ Tests to write:
                                 ensure neighbors are selected with the correct transition
                                     probabilities
 '''
+from pickletools import optimize
 import random
+import os
+import tqdm
+import pickle
 
 import networkx as nx
+
+import numpy as np
+
+import tensorflow as tf
+from tensorflow.keras import layers
+
+from .Word2Vec import Word2Vec 
+from .utils.serializer import walk_serializer
 
 class Node2Vec:
 
     def __init__(self, graph: nx.Graph, dims: int = 128, num_walks: int = 10, 
-                    walk_length: int = 80, p: float = 1, q: float = 1):
+                    walk_length: int = 80, p: float = 1, q: float = 1, epochs: int = 20):
 
         '''
         The Node2Vec class defines object which encapsultes the methods
@@ -114,6 +136,8 @@ class Node2Vec:
         self.p = p
         self.q = q
 
+        self.epochs = epochs
+
         # Create graph G' to contain transition probabilities
         # G' has the same nodes as G, but edges are weighted by transition 
         # probabilities. Because probabilities based on second degree paths
@@ -122,7 +146,7 @@ class Node2Vec:
 
         print(f'\nNew Node2Vec instance created: {graph.number_of_nodes()} nodes, {graph.number_of_edges()} edges')
 
-    def preprocess_weights(self):
+    def preprocess_weights(self, use_cache: bool = False, path: str = None):
         # Create G' by calculating the transition probabilities
         # using p & q values. 
         '''
@@ -154,12 +178,21 @@ class Node2Vec:
         Notes: 
         >   Its wasteful to duplicate graph -> d_graph, should change in place
         '''
+
+        if (use_cache):
+            success = self.load_graph(path)
+            if(success):
+                print('Matching graph loaded from cache')
+                return 
+
         graph = self.graph
         d_graph = self.d_graph
 
         nodes = graph.nodes
 
-        for source in nodes:
+        print(f'Preprocessing edge weights for {len(self.graph.nodes)} nodes')
+
+        for source in tqdm.tqdm(nodes):
 
             first_degree_neighbors = [n for n in d_graph.neighbors(source)]
 
@@ -177,29 +210,29 @@ class Node2Vec:
 
                 unnormalised_transition_probabilities = {}
 
-                print(f'Source: {source}')  
-                print(f'Neighbor: {neighbor}')            
+                # print(f'Source: {source}')  
+                # print(f'Neighbor: {neighbor}')            
 
                 for destination in second_degree_neighbors:
 
                     weight = d_graph[neighbor][destination].get('weight', 1)
                     weight = float(weight)
                     
-                    print(f'Destination: {destination}')    
+                    # print(f'Destination: {destination}')    
 
                     # Calculate the modified weights
                     if destination == source:
                         # Backwards probability
                         transition_prob = weight * (1. / self.p)
-                        print(f"Back to source. Weight: {weight} transition {transition_prob}")
+                        # print(f"Back to source. Weight: {weight} transition {transition_prob}")
                     elif destination in first_degree_neighbors:
                         # BFS-like probability
                         transition_prob = weight * 1
-                        print(f"BFS. Weight: {weight} transition {transition_prob}")
+                        # print(f"BFS. Weight: {weight} transition {transition_prob}")
                     else:
                         # DFS-like probability
                         transition_prob = weight * (1. / self.q)
-                        print(f"DFS. Weight: {weight} transition {transition_prob}")
+                        # print(f"DFS. Weight: {weight} transition {transition_prob}")
 
                     unnormalised_transition_probabilities[destination] = transition_prob
 
@@ -213,7 +246,12 @@ class Node2Vec:
                 key = 'second_order_probs'
                 d_graph[source][neighbor][key] = normalised_transition_probabilities
 
-                print()
+        
+        # Save this object 
+        if (use_cache): 
+            self.save_graph(path)
+
+        print()
 
     def generate_walks(self, num_walks: int = None, walk_length: int = None):
         '''
@@ -237,9 +275,12 @@ class Node2Vec:
         nodes = list(graph.nodes)
 
         # Generate walks
-        for walk in range(num_walks):
 
-            print(f"Walk iteration: {walk}")
+        print(f'Generating {num_walks} random walks for {len(self.graph.nodes)} nodes')
+
+        for walk in tqdm.tqdm(range(num_walks)):
+
+            # print(f"Walk iteration: {walk}")
             random.shuffle(nodes)
 
             for source in nodes:
@@ -281,9 +322,13 @@ class Node2Vec:
                 
                 walks.append(sample)
 
+        print()
+
         return walks
 
+    def stringify(self, walks):
 
+        return [' '.join([str(word) for word in line]) for line in walks]
 
 
         
@@ -292,14 +337,160 @@ class Node2Vec:
 
 
     
-    def fit(self):
+    def fit(self, walks, epochs=None, use_cache=False, path=None):
         '''
         Input:
         > Take the context window size as input here
-        '''
+
+        Steps:
+        > Take the generated walks as input [(num_nodes * num_walks) * walk_length]
+        > Define targets, contexts and labels as empty lists
+        > For each walk, generate skipgram pairs
+        > For each target in skip gram pairs
+        >   Create negative sample
+
         # Learn the node embeddings via a lookup table using
         # stochastic gradient descent
-        pass
+
+        '''
+
+        vocab = self.d_graph.nodes
+        vocab_size = len(vocab) + 10 # for any unknown, empty or padded tokens that could get added
+        embedding_dim = self.dims
+        seed = 3
+        autotune = tf.data.AUTOTUNE
+        negative_samples = 5
+        window_size = 5
+        batch_size = 1024
+        buffer_size = 10000
+        sequence_length = self.walk_length
+        epochs = epochs if epochs else self.epochs
+        
+        stringified_walks = self.stringify(walks)
+
+        dataset = tf.data.Dataset.from_tensor_slices(stringified_walks)
+
+        # Instantiate Word2Vec model
+        w2v = Word2Vec( window_size=window_size, 
+                        batch_size=batch_size, 
+                        buffer_size=buffer_size, 
+                        sequence_length=sequence_length,
+                        vocab_size=vocab_size, 
+                        embedding_dim=embedding_dim, 
+                        negative_samples=negative_samples, 
+                        autotune=seed, 
+                        seed=autotune)
+
+        w2v.create_vocabulary(walk_serializer, dataset) 
+
+        vectorised_data = w2v.vectorize_text(dataset)
+
+        dataset = w2v.create_training_data(vectorised_data, use_cache=use_cache, path=path)
+
+        w2v.create_embedding_layers()
+
+        w2v.compile_model()
+
+        path_logs = os.path.join(path, 'logs')
+        path_checkpoint = os.path.join(path, 'checkpoints/checkpoint')
+        path_model = os.path.join(path, 'models/embedding')
+        path_tv_layer = os.path.join(path, 'models/embedding/textVectorisation')
+
+        tensorboard_callback = tf.keras.callbacks.TensorBoard(log_dir=path_logs)
+        checkpoint_callback = tf.keras.callbacks.ModelCheckpoint(
+                                filepath=path_checkpoint,
+                                save_weights_only=False, # This is False to try and save TextVectorisation layer
+                                verbose=1)
+
+        w2v.fit(dataset, epochs=epochs, callbacks=[tensorboard_callback, checkpoint_callback])
+
+        if (use_cache): 
+            self.save_tv_layer(w2v.vectorize_layer, path_tv_layer) 
+
+        w2v.save(path_model)
+
+        w2v.summary()
+
+        # embedding_layer = w2v.get_layer('w2v_embedding')
+
+        # print(embedding_layer.get_weights())
+
+        os.system(f"tensorboard --logdir {path_logs}")
+
+        # print(list(dataset.as_numpy_iterator()))
+        # print(self.d_graph.nodes)
+        # print(w2v.inverse_vocab)
+        # print(len(w2v.inverse_vocab))
+
+    def save_graph(self, path): 
+        '''
+        Pickles the d_graph to economise compute for 
+        preprocessing weights
+        '''
+
+        # graph_hash = hash(str(list(self.graph.edges)))
+
+        filename = f"{path}/{self.p}-{self.q}.gpickle"
+
+        # nx.write_gpickle(self, filename) ## Note: may need to provide graph
+
+        with open(filename, 'wb') as pickle_out:
+            pickle.dump(self, pickle_out)
+
+        return filename
+
+
+
+    def load_graph(self, path):
+
+        # graph_hash = hash(str(list(self.graph.edges)))
+
+        filename = f"{path}/{self.p}-{self.q}.gpickle"
+
+        if (os.path.exists(filename)): 
+
+            print("LOADING GRAPH")
+            # self = nx.read_gpickle(filename)
+            with open(filename, 'rb') as pickle_in:
+                n2v_in = pickle.load(pickle_in)
+                self.graph = n2v_in.graph
+                self.d_graph = n2v_in.d_graph
+            print(self.graph)
+            print(self.d_graph)
+
+            return filename
+        
+        else:
+
+            return None
+
+    def save_tv_layer(self, layer, filepath):
+
+        '''
+        Pickle the text vectorisation layer so that it can 
+        be recreated when we load the trained model weights
+        '''
+
+        config = layer.get_config()
+        weights = layer.get_weights()
+
+        config['standardize'] = None
+
+        print(config)
+        print(weights)
+
+
+        filename = f"{filepath}/{self.p}-{self.q}.gpickle"
+
+        with open(filename, 'wb') as pickle_out:
+            pickle.dump({
+                "config": config,
+                "weights": weights
+            }, pickle_out)
+
+        print('PICKLED TV LAYER CONFIG & WEIGHTS')
+        
+        
     
     def embed_nodes(self):
         # Return a N x D array of node embeddings
